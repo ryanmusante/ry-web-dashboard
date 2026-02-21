@@ -1,0 +1,18 @@
+[Unit]
+Description=ry-web-dashboard — Web UI for ry-install
+Documentation=https://github.com/ryanmusante/ry-install
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/ry-web-dashboard/ry-web-dashboard.py --host 0.0.0.0 --port 9000 --script %h/ry-install/ry-install.fish
+WorkingDirectory=%h/ry-web-dashboard
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Note: ry-install uses sudo internally for privileged operations.
+# Configure NOPASSWD sudo for unattended use (see README).
+
+[Install]
+WantedBy=default.target

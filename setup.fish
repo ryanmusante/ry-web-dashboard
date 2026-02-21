@@ -1,0 +1,89 @@
+#!/usr/bin/env fish
+# ry-web-dashboard setup — installs dependencies and configures systemd user service
+# Usage: fish setup.fish [--script /path/to/ry-install.fish]
+
+set -l script_path ""
+
+# Parse args
+set -l i 1
+while test $i -le (count $argv)
+    switch $argv[$i]
+        case --script
+            set i (math $i + 1)
+            set script_path $argv[$i]
+        case -h --help
+            echo "Usage: fish setup.fish [--script /path/to/ry-install.fish]"
+            exit 0
+    end
+    set i (math $i + 1)
+end
+
+set -l dash_dir (status dirname)
+set -l svc_dir "$HOME/.config/systemd/user"
+
+echo "ry-web-dashboard setup"
+echo "────────────────────"
+
+# 1. Install aiohttp
+echo "Installing aiohttp..."
+pip install aiohttp --break-system-packages --quiet 2>/dev/null
+or begin
+    echo "Error: pip install failed" >&2
+    exit 1
+end
+echo "  ✓ aiohttp installed"
+
+# 2. Locate ry-install.fish
+if test -z "$script_path"
+    if test -f "$dash_dir/ry-install.fish"
+        set script_path "$dash_dir/ry-install.fish"
+    else if test -f "$HOME/ry-install/ry-install.fish"
+        set script_path "$HOME/ry-install/ry-install.fish"
+    else
+        echo "Error: ry-install.fish not found" >&2
+        echo "  Pass --script /path/to/ry-install.fish or place it in ~/ry-install/" >&2
+        exit 1
+    end
+end
+echo "  ✓ ry-install.fish: $script_path"
+
+# 3. Create symlink if needed
+if not test -f "$dash_dir/ry-install.fish"
+    ln -sf "$script_path" "$dash_dir/ry-install.fish"
+    echo "  ✓ symlinked ry-install.fish"
+end
+
+# 4. Install systemd service using environment override
+# Keep %h specifiers in the unit file intact — write an environment
+# file with concrete paths so the unit stays portable.
+mkdir -p "$svc_dir"
+
+# Copy unit file as-is (preserves %h specifiers)
+cp "$dash_dir/ry-web-dashboard.service" "$svc_dir/ry-web-dashboard.service"
+
+# Write drop-in override with concrete paths
+set -l dropin_dir "$svc_dir/ry-web-dashboard.service.d"
+mkdir -p "$dropin_dir"
+printf '[Service]\nExecStart=\nExecStart=/usr/bin/python3 %s/ry-web-dashboard.py --host 0.0.0.0 --port 9000 --script %s\nWorkingDirectory=%s\n' \
+    "$dash_dir" "$script_path" "$dash_dir" > "$dropin_dir/paths.conf"
+
+systemctl --user daemon-reload
+echo "  ✓ service installed: $svc_dir/ry-web-dashboard.service"
+echo "  ✓ override: $dropin_dir/paths.conf"
+
+# 5. Enable and start
+systemctl --user enable --now ry-web-dashboard.service 2>/dev/null
+set -l svc_status (systemctl --user is-active ry-web-dashboard.service 2>/dev/null)
+if test "$svc_status" = active
+    echo "  ✓ service running"
+else
+    echo "  ⚠ service status: $svc_status"
+    echo "  Check: journalctl --user -u ry-web-dashboard.service"
+end
+
+echo ""
+echo "Dashboard: http://localhost:9000"
+set -l lan_ip (ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+if test -n "$lan_ip"
+    echo "LAN:       http://$lan_ip:9000"
+end
