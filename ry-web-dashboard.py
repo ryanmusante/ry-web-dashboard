@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ry-web-dashboard v1.2.0 — Web dashboard for ry-install
-2026-02-20 | MIT License
+ry-web-dashboard v1.3.0 — Web dashboard for ry-install
+2026-02-27 | MIT License
 
 Async HTTP server wrapping ry-install.fish with live sysfs telemetry via SSE.
 
@@ -34,10 +34,13 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_SCRIPT = str(SCRIPT_DIR / "ry-install.fish")
 STATIC_DIR = SCRIPT_DIR / "static"
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SSE_INTERVAL = 2
 COMMAND_TIMEOUT = 120
-LOG_TARGETS = frozenset(("system", "gpu", "wifi", "boot", "audio", "usb", "kernel"))
+LOG_TARGETS = frozenset((
+    "system", "gpu", "wifi", "boot", "audio", "usb", "kernel",
+    "analyze", "last", "list", "all",
+))
 MANAGED_FILES: list[str] = []
 
 # Env vars safe to pass to subprocesses
@@ -378,7 +381,13 @@ async def h_lint(req: web.Request) -> web.Response:
     return _resp(*await run_cmd(req.app, "--lint"))
 
 async def h_changelog(req: web.Request) -> web.Response:
-    return _resp(*await run_cmd(req.app, "--changelog"))
+    script_path = Path(req.app["script"])
+    changelog = script_path.parent / "CHANGELOG.txt"
+    try:
+        content = changelog.read_text()
+        return _resp(0, content, "")
+    except OSError:
+        return _resp(1, "", f"CHANGELOG.txt not found at {changelog}")
 
 
 async def h_logs(req: web.Request) -> web.Response:
@@ -433,6 +442,18 @@ async def h_test_all(req: web.Request) -> web.Response:
         return _resp(*await run_cmd(req.app, "--test-all", timeout=300))
 
 
+async def h_profile(req: web.Request) -> web.Response:
+    async with req.app["lock"]:
+        log.info("action=profile")
+        return _resp(*await run_cmd(req.app, "--profile", timeout=180))
+
+
+async def h_stress(req: web.Request) -> web.Response:
+    async with req.app["lock"]:
+        log.info("action=stress")
+        return _resp(*await run_cmd(req.app, "--stress", timeout=300))
+
+
 async def h_managed(req: web.Request) -> web.Response:
     return web.json_response({"files": MANAGED_FILES})
 
@@ -465,7 +486,12 @@ def extract_managed_files(path: str) -> list[str]:
             if f"set -g {var}" in line:
                 in_block = True
             if in_block:
+                # Capture quoted paths: "/etc/kernel/cmdline"
                 files.extend(m.group(1) for m in re.finditer(r'"([^"]+)"', line))
+                # Capture unquoted paths: /etc/kernel/cmdline (bare tokens starting with /)
+                stripped = line.strip().rstrip("\\").strip()
+                if stripped.startswith("/") and '"' not in stripped:
+                    files.append(stripped)
                 if "\\" not in line:
                     in_block = False
     return files
@@ -491,6 +517,8 @@ def create_app(script: str) -> web.Application:
     r.add_post("/api/install", h_install)
     r.add_post("/api/install-file", h_install_file)
     r.add_post("/api/test-all", h_test_all)
+    r.add_post("/api/profile", h_profile)
+    r.add_post("/api/stress", h_stress)
     if STATIC_DIR.exists():
         r.add_static("/static", STATIC_DIR, show_index=False)
     r.add_get("/", h_index)

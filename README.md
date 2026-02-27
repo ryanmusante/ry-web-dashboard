@@ -1,4 +1,4 @@
-# ry-web-dashboard v1.2.0
+# ry-web-dashboard v1.3.0
 
 Web dashboard for [ry-install](https://github.com/ryanmusante/ry-install) — monitor, verify, and manage your CachyOS configuration from a browser.
 
@@ -10,10 +10,10 @@ Web dashboard for [ry-install](https://github.com/ryanmusante/ry-install) — mo
 | **Diagnose** | `--diagnose --json` | Full system diagnostics with issue summary |
 | **Config Drift** | `--diff` / `--verify-static` | Detect config file drift and verify static content |
 | **Runtime** | `--verify-runtime` | Verify live kernel params, services, sysfs state |
-| **Logs** | `--logs <target>` | View system, gpu, wifi, boot, audio, usb, kernel logs |
+| **Logs** | `--logs <target>` | View system, gpu, wifi, boot, audio, usb, kernel logs + analyze, last, list, all |
 | **Lint** | `--lint` | Fish syntax and anti-pattern checks |
-| **Actions** | `--clean`, `--all`, `--install-file`, `--test-all` | System cleanup, full install, single-file deploy, test suite |
-| **Changelog** | `--changelog` | Embedded version history |
+| **Actions** | `--clean`, `--all`, `--install-file`, `--test-all`, `--profile`, `--stress` | System cleanup, full install, single-file deploy, test suite, profile, stress test |
+| **Changelog** | CHANGELOG.txt | Embedded version history read from ry-install directory |
 
 The live monitor reads sysfs directly (no subprocesses) for minimal overhead. All other tabs execute `ry-install.fish` with the appropriate flags.
 
@@ -97,13 +97,15 @@ ryan ALL=(ALL) NOPASSWD: ALL
 | `/api/verify/runtime` | GET | `--verify-runtime` |
 | `/api/lint` | GET | `--lint` |
 | `/api/logs/{target}` | GET | `--logs <target>` |
-| `/api/changelog` | GET | `--changelog` |
+| `/api/changelog` | GET | Read CHANGELOG.txt from ry-install directory |
 | `/api/managed-files` | GET | List of managed file paths |
 | `/api/info` | GET | Dashboard + ry-install version info |
 | `/api/clean` | POST | `--clean --force [--dry-run]` |
 | `/api/install` | POST | `--all [--dry-run]` |
 | `/api/install-file` | POST | `--install-file <path> [--dry-run]` |
 | `/api/test-all` | POST | `--test-all` |
+| `/api/profile` | POST | `--profile` |
+| `/api/stress` | POST | `--stress` |
 
 POST bodies accept `{"dry_run": true}` (default: true for safety).
 
@@ -113,6 +115,7 @@ POST bodies accept `{"dry_run": true}` (default: true for safety).
 Browser ──► ry-web-dashboard.py (aiohttp) ──► ry-install.fish (subprocess)
                 │                              │
                 ├─ /api/telemetry/stream ──► sysfs (direct read, no subprocess)
+                ├─ /api/changelog ──► CHANGELOG.txt (direct read)
                 └─ /static/index.html ──► SPA (vanilla JS, no build step)
                    /static/app.js
 ```

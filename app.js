@@ -1,5 +1,5 @@
 'use strict';
-// ry-web-dashboard v1.2.0 — frontend application
+// ry-web-dashboard v1.3.0 — frontend application
 
 // ── Theme ─────────────────────────────────────────────────────────────────
 const THEME_KEY = 'ry-dash-theme';
@@ -158,7 +158,7 @@ function buildPanels() {
 </div>
 <div class="tab hidden" id="p-logs">
   <div class="toolbar"><h2>Log Viewer</h2>
-    <select id="log-sel"><option>system</option><option>gpu</option><option>wifi</option><option>boot</option><option>audio</option><option>usb</option><option>kernel</option></select>
+    <select id="log-sel"><option>system</option><option>gpu</option><option>wifi</option><option>boot</option><option>audio</option><option>usb</option><option>kernel</option><option disabled>──────</option><option>last</option><option>list</option><option>all</option><option>analyze</option></select>
     <button class="btn btn-p btn-run" id="btn-logs">Fetch</button>
   </div>
   <div class="sec hidden" id="logs-sec"><div class="term" id="t-logs"></div></div>
@@ -185,6 +185,20 @@ function buildPanels() {
   <div class="sec">
     <div class="sec-label">Re-deploy Single File</div>
     <div class="c" id="files-card"><div class="empty">Loading managed files\u2026</div></div>
+  </div>
+  <div class="sec">
+    <div class="sec-label">System Profile</div>
+    <div class="c">
+      <p style="color:var(--text-dim);margin-bottom:10px;font-size:12px">Capture hardware and configuration snapshot for diagnostics.</p>
+      <button class="btn btn-p btn-run" id="btn-profile">Run Profile</button>
+    </div>
+  </div>
+  <div class="sec">
+    <div class="sec-label">Stress Test</div>
+    <div class="c">
+      <p style="color:var(--text-dim);margin-bottom:10px;font-size:12px">CPU/GPU thermal stress test with sensor monitoring.</p>
+      <button class="btn btn-d btn-run" id="btn-stress">Run Stress</button>
+    </div>
   </div>
   <div class="sec">
     <div class="sec-label">Test Suite</div>
@@ -220,6 +234,8 @@ function wireEvents() {
   on('btn-inst-dry', () => runPost('/api/install', true));
   on('btn-inst', () => showConfirm('Confirm Install', 'Deploy all managed configs, packages, and services.', () => runPost('/api/install', false)));
   on('btn-test', () => runPost('/api/test-all', null));
+  on('btn-profile', () => runPost('/api/profile', null));
+  on('btn-stress', () => showConfirm('Confirm Stress Test', 'Run CPU/GPU thermal stress test. System will be under full load.', () => runPost('/api/stress', null)));
 
   $('#files-card').addEventListener('click', e => {
     const btn = e.target.closest('button[data-path]');
