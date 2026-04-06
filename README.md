@@ -207,4 +207,4 @@ sudo firewall-cmd --reload
 
 ## License
 
-MIT
+[MIT](LICENSE)
