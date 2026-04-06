@@ -14,7 +14,6 @@ ry-web-dashboard changelog
 - fix: move index.html and app.js into static/ subdirectory.
 - fix: Documentation URL points to ry-web-dashboard repo.
 - docs: sync README with codebase.
-
 - Tagged as v1.4.0
 - feat: bearer token auth via RY_DASH_TOKEN env var.
 - feat: SSE connection limit (max 5 concurrent).
