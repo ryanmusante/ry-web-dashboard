@@ -6,6 +6,8 @@
 
 Web dashboard for [ry-install](https://github.com/ryanmusante/ry-install) — monitor, verify, and manage your CachyOS configuration from a browser.
 
+[changelog](CHANGELOG.md)
+
 ## Features
 
 | Tab | Mode | Description |
