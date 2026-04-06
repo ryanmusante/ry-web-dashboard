@@ -1,5 +1,5 @@
 'use strict';
-// ry-web-dashboard v1.3.0 — frontend application
+// ry-web-dashboard v1.4.0 — frontend application
 
 // ── Theme ─────────────────────────────────────────────────────────────────
 const THEME_KEY = 'ry-dash-theme';
@@ -483,13 +483,15 @@ function spark(id, arr, val, mx) {
   if (arr.length > HIST) arr.shift();
   const el = $('#' + id);
   if (!el) return;
-  el.innerHTML = '';
+  while (el.children.length < arr.length)
+    el.appendChild(document.createElement('i'));
+  while (el.children.length > arr.length)
+    el.removeChild(el.lastChild);
   arr.forEach((v, idx) => {
-    const s = document.createElement('i');
+    const s = el.children[idx];
     s.style.height = Math.max(2, (v / mx) * 36) + 'px';
     s.style.background = v > mx * 0.85 ? 'var(--err)' : v > mx * 0.7 ? 'var(--warn)' : 'var(--accent)';
     s.style.opacity = idx === arr.length - 1 ? '1' : '0.6';
-    el.appendChild(s);
   });
 }
 

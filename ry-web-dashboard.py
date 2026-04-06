@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ry-web-dashboard v1.3.0 — Web dashboard for ry-install
-2026-02-27 | MIT License
+ry-web-dashboard v1.4.0 — Web dashboard for ry-install
+2026-04-05 | MIT License
 
 Async HTTP server wrapping ry-install.fish with live sysfs telemetry via SSE.
 
@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -34,14 +33,19 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_SCRIPT = str(SCRIPT_DIR / "ry-install.fish")
 STATIC_DIR = SCRIPT_DIR / "static"
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 SSE_INTERVAL = 2
 COMMAND_TIMEOUT = 120
 LOG_TARGETS = frozenset((
     "system", "gpu", "wifi", "boot", "audio", "usb", "kernel",
     "analyze", "last", "list", "all",
 ))
-MANAGED_FILES: list[str] = []
+SERVICES = ("cpupower-epp", "fstrim.timer", "amdgpu-performance", "NetworkManager")
+MAX_SSE_CLIENTS = 5
+_sse_count = 0
+_static_cache: dict[str, Any] = {}
+
+AUTH_TOKEN = os.environ.get("RY_DASH_TOKEN", "")
 
 # Env vars safe to pass to subprocesses
 _SAFE_ENV_KEYS = frozenset((
@@ -56,7 +60,10 @@ CSP = (
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
     "font-src https://fonts.gstatic.com; "
     "connect-src 'self'; "
-    "img-src 'self'"
+    "img-src 'self'; "
+    "base-uri 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'none'"
 )
 
 log = logging.getLogger("ry-web-dashboard")
@@ -65,10 +72,23 @@ log = logging.getLogger("ry-web-dashboard")
 # ── Middleware ─────────────────────────────────────────────────────────────
 
 @web.middleware
+async def auth_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+    """Bearer token authentication for API endpoints."""
+    if not AUTH_TOKEN:
+        return await handler(request)
+    if request.path.startswith("/api/"):
+        token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        if token != AUTH_TOKEN:
+            return web.json_response({"error": "Unauthorized"}, status=401)
+    return await handler(request)
+
+
+@web.middleware
 async def security_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
     """CSRF check on POST + security headers on all responses."""
     if request.method == "POST":
         origin = request.headers.get("Origin")
+        referer = request.headers.get("Referer")
         if origin:
             parsed = urlparse(origin)
             host_hdr = request.headers.get("Host", "")
@@ -76,6 +96,13 @@ async def security_middleware(request: web.Request, handler: Any) -> web.StreamR
             if host_hdr not in (expected, f"{parsed.hostname}:{request.url.port}"):
                 log.warning("action=csrf_block origin=%s host=%s", origin, host_hdr)
                 return web.json_response({"error": "Origin mismatch"}, status=403)
+        elif referer:
+            parsed = urlparse(referer)
+            host_hdr = request.headers.get("Host", "")
+            expected = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+            if host_hdr not in (expected, f"{parsed.hostname}:{request.url.port}"):
+                log.warning("action=csrf_block referer=%s host=%s", referer, host_hdr)
+                return web.json_response({"error": "Referer mismatch"}, status=403)
 
     resp = await handler(request)
 
@@ -84,6 +111,12 @@ async def security_middleware(request: web.Request, handler: Any) -> web.StreamR
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=(), "
+        "payment=(), usb=(), interest-cohort=()"
+    )
+    if request.path.startswith("/api/") and "/stream" not in request.path:
+        resp.headers["Cache-Control"] = "no-store"
 
     return resp
 
@@ -174,18 +207,22 @@ def _net_interfaces() -> list[dict[str, Any]]:
     return out
 
 
-def _service_states() -> dict[str, str]:
-    svcs = {}
-    for svc in ("cpupower-epp", "fstrim.timer", "amdgpu-performance", "NetworkManager"):
+async def _service_states() -> dict[str, str]:
+    """Check systemd service states in parallel."""
+    async def _check(svc: str) -> tuple[str, str]:
         try:
-            r = subprocess.run(
-                ["systemctl", "is-active", svc],
-                capture_output=True, text=True, timeout=5,
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "is-active", svc,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=_filtered_env(),
             )
-            svcs[svc] = r.stdout.strip() or "unknown"
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            return svc, out.decode().strip() or "unknown"
         except Exception:
-            svcs[svc] = "unknown"
-    return svcs
+            return svc, "unknown"
+    results = await asyncio.gather(*[_check(s) for s in SERVICES])
+    return dict(results)
 
 
 def _zram_info() -> dict[str, Any]:
@@ -209,6 +246,12 @@ def _disk_pct() -> int | None:
 
 def gather_telemetry() -> dict[str, Any]:
     """Full system telemetry from sysfs — zero subprocesses."""
+    # Cache values that don't change at runtime
+    if not _static_cache:
+        _static_cache["kernel"] = _sysfs("/proc/sys/kernel/osrelease")
+        _static_cache["vram_total"] = _glob_int("/sys/class/drm/card*/device/mem_info_vram_total") // 1_048_576
+        _static_cache["zram"] = _zram_info()
+
     cpu_t = _hwmon_temp("k10temp") or _hwmon_temp("zenpower")
     gpu_t = _gpu_temp()
     pkg_w = _power_watts("/sys/class/hwmon/hwmon*/power1_average")
@@ -245,7 +288,7 @@ def gather_telemetry() -> dict[str, Any]:
             "busy": _glob_int("/sys/class/drm/card*/device/gpu_busy_percent"),
             "temp": round(gpu_t, 1) if gpu_t is not None else None,
             "vram_used": _glob_int("/sys/class/drm/card*/device/mem_info_vram_used") // 1_048_576,
-            "vram_total": _glob_int("/sys/class/drm/card*/device/mem_info_vram_total") // 1_048_576,
+            "vram_total": _static_cache.get("vram_total", 0),
         },
         "mem": {"total": mt, "used": mt - ma, "avail": ma},
         "swap": {"total": st, "used": st - sf},
@@ -253,9 +296,9 @@ def gather_telemetry() -> dict[str, Any]:
         "disk": _disk_pct(),
         "net": _net_interfaces(),
         "ntsync": Path("/dev/ntsync").is_char_device(),
-        "zram": _zram_info(),
+        "zram": _static_cache.get("zram", {"active": False, "algo": None, "size_gb": 0}),
         "load": _sysfs("/proc/loadavg").split()[:3],
-        "kernel": _sysfs("/proc/sys/kernel/osrelease"),
+        "kernel": _static_cache.get("kernel", ""),
     }
 
 
@@ -307,34 +350,41 @@ def _resp(rc: int, stdout: str, stderr: str, **kw: Any) -> web.Response:
 async def h_telemetry(req: web.Request) -> web.Response:
     loop = asyncio.get_event_loop()
     data = await loop.run_in_executor(None, gather_telemetry)
-    data["svc"] = await loop.run_in_executor(None, _service_states)
+    data["svc"] = await _service_states()
     return web.json_response(data)
 
 
 async def h_sse(req: web.Request) -> web.StreamResponse:
-    resp = web.StreamResponse(headers={
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    })
-    await resp.prepare(req)
-    loop = asyncio.get_event_loop()
-    svc_cache: dict[str, str] = {}
-    svc_ts = 0.0
-    log.info("action=sse_connect client=%s", req.remote)
+    global _sse_count
+    if _sse_count >= MAX_SSE_CLIENTS:
+        return web.json_response({"error": "Too many SSE clients"}, status=503)
+    _sse_count += 1
     try:
-        while True:
+        resp = web.StreamResponse(headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        })
+        await resp.prepare(req)
+        loop = asyncio.get_event_loop()
+        svc_cache: dict[str, str] = {}
+        svc_ts = 0.0
+        log.info("action=sse_connect client=%s count=%d", req.remote, _sse_count)
+        while not req.app.get("shutting_down"):
             data = await loop.run_in_executor(None, gather_telemetry)
             now = time.time()
             if now - svc_ts > 10:
-                svc_cache = await loop.run_in_executor(None, _service_states)
+                svc_cache = await _service_states()
                 svc_ts = now
             data["svc"] = svc_cache
             await resp.write(f"data: {json.dumps(data)}\n\n".encode())
             await asyncio.sleep(SSE_INTERVAL)
     except (ConnectionResetError, ConnectionAbortedError, asyncio.CancelledError):
-        log.info("action=sse_disconnect client=%s", req.remote)
+        pass
+    finally:
+        _sse_count -= 1
+        log.info("action=sse_disconnect client=%s count=%d", req.remote, _sse_count)
     return resp
 
 
@@ -360,10 +410,11 @@ async def h_diagnose(req: web.Request) -> web.Response:
     rc, out, err = await run_cmd(req.app, "--diagnose", "--json", "--force")
     parsed = _extract_json_suffix(out)
     if parsed is not None:
-        # Find where the JSON started to extract raw prefix
-        json_str = json.dumps(parsed)
-        idx = out.rfind("{")
-        parsed["_raw"] = out[:idx].strip() if idx >= 0 else ""
+        lines = out.split("\n")
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].lstrip().startswith("{"):
+                parsed["_raw"] = "\n".join(lines[:i]).strip()
+                break
         return web.json_response(parsed)
     return _resp(rc, out, err)
 
@@ -392,7 +443,7 @@ async def h_changelog(req: web.Request) -> web.Response:
 
 async def h_logs(req: web.Request) -> web.Response:
     target = req.match_info["target"]
-    if target not in LOG_TARGETS and not re.fullmatch(r"[a-zA-Z0-9._-]+", target):
+    if target not in LOG_TARGETS:
         return web.json_response({"error": f"Invalid target: {target}"}, status=400)
     return _resp(*await run_cmd(req.app, "--logs", target), target=target)
 
@@ -429,7 +480,7 @@ async def h_install_file(req: web.Request) -> web.Response:
         b = await _body(req)
         fp = b.get("path", "")
         dry = b.get("dry_run", True)
-        if not fp or fp not in MANAGED_FILES:
+        if not fp or fp not in req.app["managed_files"]:
             return web.json_response({"error": f"Not a managed file: {fp}"}, status=400)
         args = ["--install-file", fp] + (["--dry-run"] if dry else [])
         log.info("action=install_file path=%s dry_run=%s", fp, dry)
@@ -455,7 +506,7 @@ async def h_stress(req: web.Request) -> web.Response:
 
 
 async def h_managed(req: web.Request) -> web.Response:
-    return web.json_response({"files": MANAGED_FILES})
+    return web.json_response({"files": req.app["managed_files"]})
 
 
 async def h_info(req: web.Request) -> web.Response:
@@ -464,7 +515,7 @@ async def h_info(req: web.Request) -> web.Response:
         "dashboard": VERSION,
         "ry_install": out.strip(),
         "log_targets": sorted(LOG_TARGETS),
-        "managed_files_count": len(MANAGED_FILES),
+        "managed_files_count": len(req.app["managed_files"]),
     })
 
 
@@ -498,9 +549,18 @@ def extract_managed_files(path: str) -> list[str]:
 
 
 def create_app(script: str) -> web.Application:
-    app = web.Application(middlewares=[security_middleware])
+    app = web.Application(
+        middlewares=[auth_middleware, security_middleware],
+        client_max_size=1024 * 64,
+    )
     app["script"] = script
     app["lock"] = asyncio.Lock()
+
+    async def on_shutdown(a: web.Application) -> None:
+        a["shutting_down"] = True
+
+    app.on_shutdown.append(on_shutdown)
+
     r = app.router
     r.add_get("/api/telemetry", h_telemetry)
     r.add_get("/api/telemetry/stream", h_sse)
@@ -520,6 +580,9 @@ def create_app(script: str) -> web.Application:
     r.add_post("/api/profile", h_profile)
     r.add_post("/api/stress", h_stress)
     if STATIC_DIR.exists():
+        # NOTE: add_static() is for development only per aiohttp docs.
+        # Past CVEs (GHSA-5h86-8mv2-jq9f) only affected add_static users.
+        # Acceptable risk for LAN-only personal workstation dashboard.
         r.add_static("/static", STATIC_DIR, show_index=False)
     r.add_get("/", h_index)
     r.add_get("/{tail:(?!api/).*}", h_index)
@@ -537,18 +600,20 @@ def main() -> None:
     p.add_argument("--host", default=DEFAULT_HOST)
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--script", default=DEFAULT_SCRIPT)
+    p.add_argument("--version", action="version", version=f"ry-web-dashboard {VERSION}")
     a = p.parse_args()
     if not Path(a.script).exists():
         log.error("action=startup err=script_not_found path=%s", a.script)
         sys.exit(1)
-    global MANAGED_FILES
-    MANAGED_FILES = extract_managed_files(a.script)
     app = create_app(a.script)
+    app["managed_files"] = extract_managed_files(a.script)
     if a.host != "127.0.0.1":
-        log.warning("action=startup bind=%s note=LAN-accessible,no-auth", a.host)
+        log.warning("action=startup bind=%s note=LAN-accessible%s", a.host,
+                     ",no-auth" if not AUTH_TOKEN else "")
     log.info("action=startup version=%s host=%s port=%d managed_files=%d",
-             VERSION, a.host, a.port, len(MANAGED_FILES))
-    web.run_app(app, host=a.host, port=a.port, print=None)
+             VERSION, a.host, a.port, len(app["managed_files"]))
+    web.run_app(app, host=a.host, port=a.port, print=None,
+                access_log_format='%a %t "%r" %s %b %Tf')
 
 
 if __name__ == "__main__":

@@ -1,0 +1,35 @@
+ry-web-dashboard changelog
+==========================
+
+1.4.0 (2026-04-05)
+
+  - Add bearer token auth via RY_DASH_TOKEN env var
+  - Add SSE connection limit (max 5 concurrent)
+  - Add graceful shutdown handler for SSE cleanup
+  - Add systemd sandboxing (12 directives) to service unit
+  - Add After=network-online.target to service unit
+  - Expand CSP: base-uri, form-action, frame-ancestors
+  - Add Permissions-Policy, Cache-Control headers
+  - Add CSRF Referer fallback when Origin absent
+  - Set client_max_size=64KB on POST bodies
+  - Strict allowlist for /api/logs target (remove regex fallback)
+  - Convert _service_states to async parallel via asyncio.gather
+  - Cache static sysfs values (kernel, vram_total, zram) at startup
+  - Move MANAGED_FILES global to app dict
+  - Fix h_diagnose JSON index mismatch and dead code
+  - Add --version CLI flag
+  - Add access log format
+  - Add add_static risk acceptance comment
+  - Remove unused subprocess import
+  - setup.fish: use Fish argparse, idempotent pip install
+  - app.js: reuse spark DOM elements
+
+1.3.0 (2026-02-27)
+
+  - Initial release
+  - Live sysfs telemetry via SSE (2s interval)
+  - CSRF protection, CSP, security headers
+  - Filtered subprocess environment
+  - Systemd user service with drop-in override
+  - Dark/light theme with prefers-color-scheme
+  - Fish setup script

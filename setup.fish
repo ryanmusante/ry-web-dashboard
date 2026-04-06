@@ -2,21 +2,16 @@
 # ry-web-dashboard setup — installs dependencies and configures systemd user service
 # Usage: fish setup.fish [--script /path/to/ry-install.fish]
 
-set -l script_path ""
-
-# Parse args
-set -l i 1
-while test $i -le (count $argv)
-    switch $argv[$i]
-        case --script
-            set i (math $i + 1)
-            set script_path $argv[$i]
-        case -h --help
-            echo "Usage: fish setup.fish [--script /path/to/ry-install.fish]"
-            exit 0
-    end
-    set i (math $i + 1)
+argparse 'script=' 'h/help' -- $argv
+or begin
+    echo "Usage: fish setup.fish [--script /path/to/ry-install.fish]" >&2
+    exit 2
 end
+if set -q _flag_help
+    echo "Usage: fish setup.fish [--script /path/to/ry-install.fish]"
+    exit 0
+end
+set -l script_path "$_flag_script"
 
 set -l dash_dir (status dirname)
 set -l svc_dir "$HOME/.config/systemd/user"
@@ -25,11 +20,13 @@ echo "ry-web-dashboard setup"
 echo "────────────────────"
 
 # 1. Install aiohttp
-echo "Installing aiohttp..."
-pip install aiohttp --break-system-packages --quiet 2>/dev/null
-or begin
-    echo "Error: pip install failed" >&2
-    exit 1
+if not python3 -c "import aiohttp" 2>/dev/null
+    echo "Installing aiohttp..."
+    pip install aiohttp --break-system-packages --quiet 2>/dev/null
+    or begin
+        echo "Error: pip install failed" >&2
+        exit 1
+    end
 end
 echo "  ✓ aiohttp installed"
 

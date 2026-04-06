@@ -1,6 +1,8 @@
 [Unit]
 Description=ry-web-dashboard — Web UI for ry-install
 Documentation=https://github.com/ryanmusante/ry-install
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -11,8 +13,24 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
+# Sandboxing — safe subset for user unit that invokes sudo
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+NoNewPrivileges=no
+
 # Note: ry-install uses sudo internally for privileged operations.
 # Configure NOPASSWD sudo for unattended use (see README).
+# Cannot use: ProtectSystem=strict (writes /etc), ProtectHome=yes (reads ~/ry-install/),
+#             NoNewPrivileges=yes (sudo required).
 
 [Install]
 WantedBy=default.target
