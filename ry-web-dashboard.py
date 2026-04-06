@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ry-web-dashboard v1.4.0 — Web dashboard for ry-install
+ry-web-dashboard v1.5.0 — Web dashboard for ry-install
 2026-04-05 | MIT License
 
 Async HTTP server wrapping ry-install.fish with live sysfs telemetry via SSE.
@@ -33,14 +33,27 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_SCRIPT = str(SCRIPT_DIR / "ry-install.fish")
 STATIC_DIR = SCRIPT_DIR / "static"
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 SSE_INTERVAL = 2
 COMMAND_TIMEOUT = 120
 LOG_TARGETS = frozenset((
     "system", "gpu", "wifi", "boot", "audio", "usb", "kernel",
-    "analyze", "last", "list", "all",
+    "analyze", "last", "all",
 ))
-SERVICES = ("cpupower-epp", "fstrim.timer", "amdgpu-performance", "NetworkManager")
+# journalctl filters for log targets (ry-install has no --logs flag)
+_LOG_CMDS: dict[str, list[str]] = {
+    "system":  ["journalctl", "-b", "--priority=warning", "--no-pager", "-n", "200"],
+    "gpu":     ["journalctl", "-b", "-k", "--grep=amdgpu|drm|gpu", "--no-pager", "-n", "200"],
+    "wifi":    ["journalctl", "-b", "-u", "iwd", "-u", "NetworkManager", "-u", "wpa_supplicant", "--no-pager", "-n", "200"],
+    "boot":    ["journalctl", "-b", "-o", "short-monotonic", "--no-pager", "-n", "200"],
+    "audio":   ["journalctl", "-b", "-u", "pipewire", "-u", "wireplumber", "--no-pager", "-n", "200"],
+    "usb":     ["journalctl", "-b", "-k", "--grep=usb", "--no-pager", "-n", "200"],
+    "kernel":  ["journalctl", "-b", "-k", "--no-pager", "-n", "200"],
+    "analyze": ["systemd-analyze", "blame"],
+    "last":    ["journalctl", "-b", "-1", "--priority=warning", "--no-pager", "-n", "200"],
+    "all":     ["journalctl", "-b", "--no-pager", "-n", "500"],
+}
+SERVICES = ("cpupower-epp", "fstrim.timer", "NetworkManager")
 MAX_SSE_CLIENTS = 5
 _sse_count = 0
 _static_cache: dict[str, Any] = {}
@@ -388,35 +401,16 @@ async def h_sse(req: web.Request) -> web.StreamResponse:
     return resp
 
 
-def _extract_json_suffix(text: str) -> dict[str, Any] | None:
-    """Extract trailing JSON object from mixed text output.
-
-    Scans backwards for line-starting '{', tries json.loads from each
-    candidate position. More robust than a single rfind.
-    """
-    lines = text.split("\n")
-    for i in range(len(lines) - 1, -1, -1):
-        stripped = lines[i].lstrip()
-        if stripped.startswith("{"):
-            candidate = "\n".join(lines[i:])
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-    return None
-
-
-async def h_diagnose(req: web.Request) -> web.Response:
-    rc, out, err = await run_cmd(req.app, "--diagnose", "--json", "--force")
-    parsed = _extract_json_suffix(out)
-    if parsed is not None:
-        lines = out.split("\n")
-        for i in range(len(lines) - 1, -1, -1):
-            if lines[i].lstrip().startswith("{"):
-                parsed["_raw"] = "\n".join(lines[:i]).strip()
-                break
-        return web.json_response(parsed)
-    return _resp(rc, out, err)
+async def h_check(req: web.Request) -> web.Response:
+    rc, out, err = await run_cmd(req.app, "--check", "--force")
+    # --check exit codes: 0=clean, 3=prereq fail, 10=drift
+    status_map = {0: "clean", 3: "prereq_fail", 10: "drift"}
+    return web.json_response({
+        "output": out,
+        "stderr": err,
+        "rc": rc,
+        "status": status_map.get(rc, "error"),
+    })
 
 
 async def h_diff(req: web.Request) -> web.Response:
@@ -445,7 +439,23 @@ async def h_logs(req: web.Request) -> web.Response:
     target = req.match_info["target"]
     if target not in LOG_TARGETS:
         return web.json_response({"error": f"Invalid target: {target}"}, status=400)
-    return _resp(*await run_cmd(req.app, "--logs", target), target=target)
+    cmd = _LOG_CMDS.get(target)
+    if not cmd:
+        return web.json_response({"error": f"No command for target: {target}"}, status=400)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_filtered_env(),
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        rc = proc.returncode or 0
+        return _resp(rc, out.decode(errors="replace"), err.decode(errors="replace"), target=target)
+    except asyncio.TimeoutError:
+        return _resp(124, "", f"Timed out fetching {target} logs")
+    except Exception as e:
+        return _resp(1, "", str(e))
 
 
 async def _body(req: web.Request) -> dict[str, Any]:
@@ -461,9 +471,52 @@ async def h_clean(req: web.Request) -> web.Response:
     async with req.app["lock"]:
         b = await _body(req)
         dry = b.get("dry_run", True)
-        args = ["--clean", "--force"] + (["--dry-run"] if dry else [])
         log.info("action=clean dry_run=%s", dry)
-        return _resp(*await run_cmd(req.app, *args, timeout=180), dry_run=dry)
+        parts: list[str] = []
+        env = _filtered_env()
+
+        async def _run(label: str, *cmd: str) -> None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+                parts.append(f"── {label} ──\n{out.decode(errors='replace').strip()}")
+                if err.decode(errors='replace').strip():
+                    parts.append(err.decode(errors='replace').strip())
+            except Exception as e:
+                parts.append(f"── {label} ──\n[ERR] {e}")
+
+        if dry:
+            await _run("Package cache (dry)", "paccache", "-dvk2")
+            # Check for orphans
+            await _run("Orphans", "pacman", "-Qtdq")
+            await _run("Journal size", "journalctl", "--disk-usage")
+        else:
+            await _run("Package cache", "sudo", "-n", "paccache", "-rvk2")
+            # Remove orphans if any
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "pacman", "-Qtdq",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=env,
+                )
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                orphans = out.decode().strip()
+                if orphans:
+                    await _run("Remove orphans", "sudo", "-n", "pacman", "-Rns", "--noconfirm",
+                               *orphans.splitlines())
+                else:
+                    parts.append("── Orphans ──\nNo orphans found")
+            except Exception:
+                parts.append("── Orphans ──\nNo orphans found")
+            await _run("Journal vacuum", "sudo", "-n", "journalctl", "--vacuum-size=100M")
+
+        return _resp(0, "\n\n".join(parts), "", dry_run=dry)
 
 
 async def h_install(req: web.Request) -> web.Response:
@@ -493,16 +546,13 @@ async def h_test_all(req: web.Request) -> web.Response:
         return _resp(*await run_cmd(req.app, "--test-all", timeout=300))
 
 
-async def h_profile(req: web.Request) -> web.Response:
+async def h_diff_fix(req: web.Request) -> web.Response:
     async with req.app["lock"]:
-        log.info("action=profile")
-        return _resp(*await run_cmd(req.app, "--profile", timeout=180))
-
-
-async def h_stress(req: web.Request) -> web.Response:
-    async with req.app["lock"]:
-        log.info("action=stress")
-        return _resp(*await run_cmd(req.app, "--stress", timeout=300))
+        b = await _body(req)
+        dry = b.get("dry_run", True)
+        args = ["--diff", "--fix", "--force"] + (["--dry-run"] if dry else [])
+        log.info("action=diff_fix dry_run=%s", dry)
+        return _resp(*await run_cmd(req.app, *args, timeout=180), dry_run=dry)
 
 
 async def h_managed(req: web.Request) -> web.Response:
@@ -515,6 +565,7 @@ async def h_info(req: web.Request) -> web.Response:
         "dashboard": VERSION,
         "ry_install": out.strip(),
         "log_targets": sorted(LOG_TARGETS),
+        "services": list(SERVICES),
         "managed_files_count": len(req.app["managed_files"]),
     })
 
@@ -564,7 +615,7 @@ def create_app(script: str) -> web.Application:
     r = app.router
     r.add_get("/api/telemetry", h_telemetry)
     r.add_get("/api/telemetry/stream", h_sse)
-    r.add_get("/api/diagnose", h_diagnose)
+    r.add_get("/api/check", h_check)
     r.add_get("/api/diff", h_diff)
     r.add_get("/api/verify/static", h_verify_static)
     r.add_get("/api/verify/runtime", h_verify_runtime)
@@ -577,8 +628,7 @@ def create_app(script: str) -> web.Application:
     r.add_post("/api/install", h_install)
     r.add_post("/api/install-file", h_install_file)
     r.add_post("/api/test-all", h_test_all)
-    r.add_post("/api/profile", h_profile)
-    r.add_post("/api/stress", h_stress)
+    r.add_post("/api/diff-fix", h_diff_fix)
     if STATIC_DIR.exists():
         # NOTE: add_static() is for development only per aiohttp docs.
         # Past CVEs (GHSA-5h86-8mv2-jq9f) only affected add_static users.

@@ -1,5 +1,5 @@
 'use strict';
-// ry-web-dashboard v1.4.0 — frontend application
+// ry-web-dashboard v1.5.0 — frontend application
 
 // ── Theme ─────────────────────────────────────────────────────────────────
 const THEME_KEY = 'ry-dash-theme';
@@ -28,7 +28,7 @@ initTheme();
 // ── Config ────────────────────────────────────────────────────────────────
 const TABS = [
   { id: 'monitor',   label: 'Monitor' },
-  { id: 'diagnose',  label: 'Diagnose' },
+  { id: 'check',     label: 'Check' },
   { id: 'drift',     label: 'Config Drift' },
   { id: 'runtime',   label: 'Runtime' },
   { id: 'logs',      label: 'Logs' },
@@ -141,14 +141,14 @@ function buildPanels() {
     <div class="c"><div class="c-label">Load Average</div><div class="sub" id="v-load" style="font-size:15px;font-family:var(--mono)">\u2014</div></div>
   </div></div>
 </div>
-<div class="tab hidden" id="p-diagnose">
-  <div class="toolbar"><h2>System Diagnostics</h2><button class="btn btn-p btn-run" id="btn-diag">Run Diagnose</button></div>
-  <div class="sec hidden" id="diag-cards-sec"><div class="g g3" id="diag-cards"></div></div>
-  <div class="sec hidden" id="diag-out-sec"><div class="sec-label">Output</div><div class="term" id="t-diag"></div></div>
+<div class="tab hidden" id="p-check">
+  <div class="toolbar"><h2>Idempotency Check</h2><button class="btn btn-p btn-run" id="btn-check">Run Check</button></div>
+  <div class="sec hidden" id="check-badge-sec"><div id="check-badge"></div></div>
+  <div class="sec hidden" id="check-out-sec"><div class="sec-label">Output</div><div class="term" id="t-check"></div></div>
 </div>
 <div class="tab hidden" id="p-drift">
   <div class="toolbar"><h2>Config Drift</h2>
-    <div class="btns"><button class="btn btn-run" id="btn-diff">Diff</button><button class="btn btn-run" id="btn-vs">Verify Static</button></div>
+    <div class="btns"><button class="btn btn-run" id="btn-diff">Diff</button><button class="btn btn-run" id="btn-vs">Verify Static</button><button class="btn btn-run" id="btn-diff-fix-dry">Fix (dry)</button><button class="btn btn-d btn-run" id="btn-diff-fix">Fix Drifted</button></div>
   </div>
   <div class="sec hidden" id="drift-sec"><div class="term" id="t-drift"></div></div>
 </div>
@@ -158,7 +158,7 @@ function buildPanels() {
 </div>
 <div class="tab hidden" id="p-logs">
   <div class="toolbar"><h2>Log Viewer</h2>
-    <select id="log-sel"><option>system</option><option>gpu</option><option>wifi</option><option>boot</option><option>audio</option><option>usb</option><option>kernel</option><option disabled>──────</option><option>last</option><option>list</option><option>all</option><option>analyze</option></select>
+    <select id="log-sel"><option>system</option><option>gpu</option><option>wifi</option><option>boot</option><option>audio</option><option>usb</option><option>kernel</option><option disabled>──────</option><option>last</option><option>all</option><option>analyze</option></select>
     <button class="btn btn-p btn-run" id="btn-logs">Fetch</button>
   </div>
   <div class="sec hidden" id="logs-sec"><div class="term" id="t-logs"></div></div>
@@ -187,23 +187,9 @@ function buildPanels() {
     <div class="c" id="files-card"><div class="empty">Loading managed files\u2026</div></div>
   </div>
   <div class="sec">
-    <div class="sec-label">System Profile</div>
-    <div class="c">
-      <p style="color:var(--text-dim);margin-bottom:10px;font-size:12px">Capture hardware and configuration snapshot for diagnostics.</p>
-      <button class="btn btn-p btn-run" id="btn-profile">Run Profile</button>
-    </div>
-  </div>
-  <div class="sec">
-    <div class="sec-label">Stress Test</div>
-    <div class="c">
-      <p style="color:var(--text-dim);margin-bottom:10px;font-size:12px">CPU/GPU thermal stress test with sensor monitoring.</p>
-      <button class="btn btn-d btn-run" id="btn-stress">Run Stress</button>
-    </div>
-  </div>
-  <div class="sec">
     <div class="sec-label">Test Suite</div>
     <div class="c">
-      <p style="color:var(--text-dim);margin-bottom:10px;font-size:12px">Run all safe modes, generate NDJSON logs.</p>
+      <p style="color:var(--text-dim);margin-bottom:10px;font-size:12px">Run all safe modes and generate NDJSON logs.</p>
       <button class="btn btn-run" id="btn-test">Run Test All</button>
     </div>
   </div>
@@ -221,9 +207,11 @@ function wireEvents() {
   const on = (id, fn) => { const el = $('#' + id); if (el) el.addEventListener('click', fn); };
 
   on('theme-toggle', toggleTheme);
-  on('btn-diag', runDiagnose);
+  on('btn-check', runCheck);
   on('btn-diff', () => runSimple('/api/diff', 't-drift'));
   on('btn-vs', () => runSimple('/api/verify/static', 't-drift'));
+  on('btn-diff-fix-dry', () => runDiffFix(true));
+  on('btn-diff-fix', () => showConfirm('Fix Drifted Files', 'Re-install all files that have drifted from expected content.', () => runDiffFix(false)));
   on('btn-vr', () => runSimple('/api/verify/runtime', 't-runtime'));
   on('btn-lint', () => runSimple('/api/lint', 't-lint'));
   on('btn-logs', () => { const t = $('#log-sel').value; runSimple('/api/logs/' + t, 't-logs'); });
@@ -234,8 +222,6 @@ function wireEvents() {
   on('btn-inst-dry', () => runPost('/api/install', true));
   on('btn-inst', () => showConfirm('Confirm Install', 'Deploy all managed configs, packages, and services.', () => runPost('/api/install', false)));
   on('btn-test', () => runPost('/api/test-all', null));
-  on('btn-profile', () => runPost('/api/profile', null));
-  on('btn-stress', () => showConfirm('Confirm Stress Test', 'Run CPU/GPU thermal stress test. System will be under full load.', () => runPost('/api/stress', null)));
 
   $('#files-card').addEventListener('click', e => {
     const btn = e.target.closest('button[data-path]');
@@ -263,50 +249,38 @@ async function runSimple(url, termId) {
   showTerm(termId, out);
 }
 
-async function runDiagnose() {
+async function runCheck() {
   if (running) return;
   setRunning(true);
-  loadingTerm('t-diag');
-  $('#diag-cards-sec').classList.add('hidden');
-  const d = await api('/api/diagnose');
+  loadingTerm('t-check');
+  $('#check-badge-sec').classList.add('hidden');
+  const d = await api('/api/check');
   setRunning(false);
-  if (!d) { showTerm('t-diag', '<span class="c-err">Request failed</span>'); return; }
+  if (!d) { showTerm('t-check', '<span class="c-err">Request failed</span>'); return; }
 
-  if (d.checks != null) {
-    const cards = $('#diag-cards');
-    cards.innerHTML = '';
+  const badge = $('#check-badge');
+  badge.innerHTML = '';
+  const cls = d.status === 'clean' ? 'badge-ok' : d.status === 'drift' ? 'badge-warn' : 'badge-err';
+  const labels = { clean: '\u2713 Clean — no drift', drift: '\u26a0 Drift detected', prereq_fail: '\u2717 Preflight failed', error: '\u2717 Error' };
+  const el = h('span', 'badge ' + cls, labels[d.status] || 'rc=' + d.rc);
+  badge.appendChild(el);
+  $('#check-badge-sec').classList.remove('hidden');
 
-    const rc = h('div', 'c');
-    const rcl = h('div', 'c-label', 'Result'); rc.appendChild(rcl);
-    const badge = h('span', 'badge ' + (d.issues === 0 ? 'badge-ok' : 'badge-warn'));
-    badge.textContent = d.issues === 0 ? '\u2713 All clear' : d.issues + ' issue(s)';
-    rc.appendChild(badge);
-    const sub = h('div', 'sub'); sub.textContent = d.checks + ' checks'; rc.appendChild(sub);
-    cards.appendChild(rc);
+  showTerm('t-check', colorize(d.output || '(no output)'));
+  $('#check-out-sec').classList.remove('hidden');
+}
 
-    const cc = h('div', 'c');
-    const ccl = h('div', 'c-label', 'CPU'); cc.appendChild(ccl);
-    const gov = d.cpu?.governor ?? d.cpu?.gov ?? '?';
-    const epp = d.cpu?.epp ?? '?';
-    const ct = d.cpu?.temp_c ?? d.cpu?.temp;
-    const cs = h('div', 'sub'); cs.textContent = gov + ' / ' + epp; cc.appendChild(cs);
-    if (ct != null) { const ctt = h('div', 'sub'); ctt.textContent = ct + '\u00b0C'; cc.appendChild(ctt); }
-    cards.appendChild(cc);
-
-    const gc = h('div', 'c');
-    const gcl = h('div', 'c-label', 'GPU'); gc.appendChild(gcl);
-    const gp = d.gpu?.perf_level ?? d.gpu?.perf ?? '?';
-    const gt = d.gpu?.temp_c ?? d.gpu?.temp;
-    const gs = h('div', 'sub'); gs.textContent = gp; gc.appendChild(gs);
-    if (gt != null) { const gtt = h('div', 'sub'); gtt.textContent = gt + '\u00b0C'; gc.appendChild(gtt); }
-    cards.appendChild(gc);
-
-    $('#diag-cards-sec').classList.remove('hidden');
-  }
-
-  const raw = d._raw || d.output || JSON.stringify(d, null, 2);
-  showTerm('t-diag', colorize(raw));
-  $('#diag-out-sec').classList.remove('hidden');
+async function runDiffFix(dry) {
+  if (running) return;
+  setRunning(true);
+  loadingTerm('t-drift');
+  const body = { dry_run: dry };
+  const d = await api('/api/diff-fix', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  setRunning(false);
+  if (!d) { showTerm('t-drift', '<span class="c-err">Request failed</span>'); return; }
+  const prefix = dry ? '[DRY RUN]\n\n' : '';
+  showTerm('t-drift', colorize(prefix + (d.output || '(no output)')));
+  if (dry === false) toast(d.rc === 0 ? 'Fix complete' : 'Finished with errors', d.rc === 0 ? 'ok' : 'err');
 }
 
 async function runPost(url, dry) {
