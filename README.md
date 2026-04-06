@@ -8,6 +8,18 @@ Web dashboard for [ry-install](https://github.com/ryanmusante/ry-install) — mo
 
 [changelog](CHANGELOG.md)
 
+## Table of Contents
+
+- [Features](#features)
+- [Project layout](#project-layout)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Usage](#usage)
+- [API Reference](#api-reference)
+- [Architecture](#architecture)
+- [Firewall](#firewall)
+- [License](#license)
+
 ## Features
 
 | Tab | Mode | Description |
