@@ -1,6 +1,6 @@
 [Unit]
 Description=ry-web-dashboard — Web UI for ry-install
-Documentation=https://github.com/ryanmusante/ry-install
+Documentation=https://github.com/ryanmusante/ry-web-dashboard
 After=network-online.target
 Wants=network-online.target
 

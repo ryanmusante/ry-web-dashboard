@@ -427,12 +427,12 @@ async def h_lint(req: web.Request) -> web.Response:
 
 async def h_changelog(req: web.Request) -> web.Response:
     script_path = Path(req.app["script"])
-    changelog = script_path.parent / "CHANGELOG.txt"
+    changelog = script_path.parent / "CHANGELOG.md"
     try:
         content = changelog.read_text()
         return _resp(0, content, "")
     except OSError:
-        return _resp(1, "", f"CHANGELOG.txt not found at {changelog}")
+        return _resp(1, "", f"CHANGELOG.md not found at {changelog}")
 
 
 async def h_logs(req: web.Request) -> web.Response:

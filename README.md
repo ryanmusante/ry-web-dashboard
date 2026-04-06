@@ -1,4 +1,8 @@
-# ry-web-dashboard v1.5.0
+# ry-web-dashboard
+
+![version](https://img.shields.io/badge/version-1.5.0-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+![python](https://img.shields.io/badge/python-3.10%2B-orange)
 
 Web dashboard for [ry-install](https://github.com/ryanmusante/ry-install) — monitor, verify, and manage your CachyOS configuration from a browser.
 
@@ -13,9 +17,32 @@ Web dashboard for [ry-install](https://github.com/ryanmusante/ry-install) — mo
 | **Logs** | `journalctl` | View system, gpu, wifi, boot, audio, usb, kernel logs + analyze, last, all |
 | **Lint** | `--lint` | Fish syntax and anti-pattern checks |
 | **Actions** | `--all`, `--install-file`, `--test-all`, cleanup | Full install, single-file deploy, test suite, system cleanup (paccache/journal vacuum) |
-| **Changelog** | CHANGELOG.txt | Embedded version history read from ry-install directory |
+| **Changelog** | CHANGELOG.md | Embedded version history read from ry-install directory |
 
 The live monitor reads sysfs directly (no subprocesses) for minimal overhead. Static values (kernel version, VRAM total, ZRAM config) are cached at startup to reduce per-tick reads. Service state checks run as parallel async subprocesses. Check, Drift, Runtime, Lint, and Actions tabs invoke `ry-install.fish` with the appropriate flags. Logs and cleanup use direct system commands.
+
+### Monitored services
+
+`cpupower-epp`, `fstrim.timer`, `NetworkManager`
+
+### Log targets
+
+`system`, `gpu`, `wifi`, `boot`, `audio`, `usb`, `kernel`, `analyze`, `last`, `all`
+
+## Project layout
+
+```
+ry-web-dashboard/
+├── ry-web-dashboard.py        # aiohttp async server (670 lines)
+├── ry-web-dashboard.service   # systemd user unit with sandboxing
+├── setup.fish                 # automated install (aiohttp, symlink, service)
+├── static/
+│   ├── index.html             # SPA shell — dark/light theme, CSS
+│   └── app.js                 # vanilla JS frontend — SSE, tabs, API calls
+├── README.md
+├── CHANGELOG.md
+└── LICENSE                    # MIT
+```
 
 ## Requirements
 
@@ -27,9 +54,8 @@ The live monitor reads sysfs directly (no subprocesses) for minimal overhead. St
 ## Install
 
 ```fish
-# 1. Clone or copy to ~/ry-web-dashboard/
-mkdir -p ~/ry-web-dashboard
-cp -r ry-web-dashboard.py static/ ry-web-dashboard.service setup.fish ~/ry-web-dashboard/
+# 1. Clone
+git clone https://github.com/ryanmusante/ry-web-dashboard.git ~/ry-web-dashboard
 
 # 2. Automated setup (installs aiohttp, configures systemd service)
 fish ~/ry-web-dashboard/setup.fish --script ~/ry-install/ry-install.fish
@@ -130,8 +156,8 @@ ryan ALL=(ALL) NOPASSWD: ALL
 | `/api/verify/static` | GET | token | `--verify-static` |
 | `/api/verify/runtime` | GET | token | `--verify-runtime` |
 | `/api/lint` | GET | token | `--lint` |
-| `/api/logs/{target}` | GET | token | `journalctl` queries (system, gpu, wifi, boot, audio, usb, kernel, analyze, last, all) |
-| `/api/changelog` | GET | token | Read CHANGELOG.txt from ry-install directory |
+| `/api/logs/{target}` | GET | token | journalctl queries (system, gpu, wifi, boot, audio, usb, kernel, analyze, last, all) |
+| `/api/changelog` | GET | token | Read CHANGELOG.md from ry-install directory |
 | `/api/managed-files` | GET | token | List of managed file paths |
 | `/api/info` | GET | token | Dashboard + ry-install version info |
 | `/api/clean` | POST | token | paccache, orphan removal, journal vacuum `[dry_run]` |
@@ -150,22 +176,23 @@ Browser ──► ry-web-dashboard.py (aiohttp) ──► ry-install.fish (subpr
                 ├─ /api/telemetry/stream ──► sysfs (direct read, no subprocess)
                 ├─ /api/logs/{target} ──► journalctl / systemd-analyze (direct)
                 ├─ /api/clean ──► paccache / pacman / journalctl (direct)
-                ├─ /api/changelog ──► CHANGELOG.txt (direct read)
-                └─ /static/index.html ──► SPA (vanilla JS, no build step)
-                   /static/app.js
+                ├─ /api/changelog ──► CHANGELOG.md (direct read)
+                └─ static/
+                   ├── index.html ──► SPA shell (dark/light theme, CSS)
+                   └── app.js ──► vanilla JS (SSE, tabs, API calls)
 ```
 
 No build tools, no node_modules, no bundlers. One Python file, one HTML shell, one JS file. Logs and cleanup use direct system commands (`journalctl`, `paccache`, `pacman`); all other operations invoke `ry-install.fish` as a subprocess. Dark/light theme toggle with `prefers-color-scheme` detection and `localStorage` persistence.
 
 ### Systemd hardening
 
-The user service unit includes sandboxing directives: `PrivateTmp`, `ProtectKernelModules`, `ProtectKernelTunables`, `ProtectKernelLogs`, `ProtectClock`, `ProtectHostname`, `ProtectControlGroups`, `RestrictSUIDSGID`, `LockPersonality`, `RestrictRealtime`, `SystemCallArchitectures=native`. Verify with:
+The user service unit includes 12 sandboxing directives: `PrivateTmp`, `ProtectKernelModules`, `ProtectKernelTunables`, `ProtectKernelLogs`, `ProtectClock`, `ProtectHostname`, `ProtectControlGroups`, `RestrictSUIDSGID`, `LockPersonality`, `RestrictRealtime`, `SystemCallArchitectures=native`, `NoNewPrivileges=no`. Verify with:
 
 ```fish
 systemd-analyze security ry-web-dashboard.service
 ```
 
-`ProtectSystem=strict`, `ProtectHome=yes`, and `NoNewPrivileges=yes` are intentionally omitted because ry-install writes to `/etc`, reads from `~/ry-install/`, and invokes `sudo`.
+`ProtectSystem=strict` and `ProtectHome=yes` are intentionally omitted because ry-install writes to `/etc` and reads from `~/ry-install/`. `NoNewPrivileges` is explicitly set to `no` because ry-install invokes `sudo`.
 
 ## Firewall
 
