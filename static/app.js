@@ -1,5 +1,5 @@
 'use strict';
-// ry-web-dashboard v1.5.0 — frontend application
+// ry-web-dashboard v1.6.1 — frontend application
 
 // ── Theme ─────────────────────────────────────────────────────────────────
 const THEME_KEY = 'ry-dash-theme';
@@ -41,7 +41,6 @@ const hist = { cpu: [], gpu: [] };
 let activeTab = 'monitor';
 let running = false;
 let evtSrc = null;
-let filesLoaded = false;
 
 // ── DOM helpers ───────────────────────────────────────────────────────────
 const $ = (s, p) => (p || document).querySelector(s);
@@ -71,13 +70,79 @@ function toast(msg, type) {
 
 async function api(url, opts) {
   try {
-    const r = await fetch(url, opts);
+    const r = await fetch(url, { credentials: 'same-origin', ...opts });
+    if (r.status === 401 || r.status === 503) {
+      // Token missing or rejected — show login overlay and retry once.
+      const ok = await promptLogin();
+      if (!ok) return null;
+      const r2 = await fetch(url, { credentials: 'same-origin', ...opts });
+      if (!r2.ok) {
+        const t = await r2.text();
+        try { return JSON.parse(t); } catch { toast(`HTTP ${r2.status}: ${t.slice(0, 120)}`, 'err'); return null; }
+      }
+      return await r2.json();
+    }
     if (!r.ok) {
       const t = await r.text();
       try { return JSON.parse(t); } catch { toast(`HTTP ${r.status}: ${t.slice(0, 120)}`, 'err'); return null; }
     }
     return await r.json();
   } catch (e) { toast('Request failed: ' + e.message, 'err'); return null; }
+}
+
+// ── Login ─────────────────────────────────────────────────────────────────
+function promptLogin() {
+  return new Promise(resolve => {
+    const ov = $('#overlay');
+    ov.innerHTML = '';
+    const dlg = h('div', 'dialog');
+    dlg.appendChild(h('h3', '', 'Authentication required'));
+    dlg.appendChild(h('p', '', 'Paste your RY_DASH_TOKEN to start a session. The token is exchanged for an HttpOnly cookie.'));
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.placeholder = 'RY_DASH_TOKEN';
+    input.className = 'login-input';
+    dlg.appendChild(input);
+    const err = h('div', 'login-err', '');
+    dlg.appendChild(err);
+    const btns = h('div', 'btns');
+    const bc = h('button', 'btn', 'Cancel');
+    const bo = h('button', 'btn btn-p', 'Sign in');
+    btns.append(bc, bo);
+    dlg.appendChild(btns);
+    ov.appendChild(dlg);
+    ov.classList.remove('hidden');
+    setTimeout(() => input.focus(), 0);
+    const close = ok => { ov.classList.add('hidden'); resolve(ok); };
+    bc.addEventListener('click', () => close(false));
+    const submit = async () => {
+      const token = input.value;
+      if (!token) { err.textContent = 'Token required'; return; }
+      bo.disabled = true;
+      try {
+        const r = await fetch('/api/login', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token }),
+        });
+        if (r.ok) {
+          // Cookie now set; reconnect SSE so it picks up the session.
+          if (evtSrc) { evtSrc.close(); evtSrc = null; }
+          connectSSE();
+          close(true);
+        } else {
+          err.textContent = r.status === 503 ? 'Server has no token configured' : 'Invalid token';
+          bo.disabled = false;
+        }
+      } catch (e) {
+        err.textContent = 'Request failed: ' + e.message;
+        bo.disabled = false;
+      }
+    };
+    bo.addEventListener('click', submit);
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+  });
 }
 
 function setRunning(v) {
@@ -111,7 +176,7 @@ function buildNav() {
     activeTab = btn.dataset.tab;
     $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === activeTab));
     $$('.tab', $('#main')).forEach(p => p.classList.toggle('hidden', p.id !== 'p-' + activeTab));
-    if (activeTab === 'actions' && !filesLoaded) { loadFiles(); filesLoaded = true; }
+    if (activeTab === 'actions') { loadFiles(); }
   });
 }
 
@@ -123,13 +188,13 @@ function buildPanels() {
   <div class="sec"><div class="g g4" id="top-row">
     <div class="c"><div class="c-label">CPU Temp</div><div class="val" id="v-ct">\u2014<span class="unit">\u00b0C</span></div><div class="sub" id="v-cg"></div><div class="spark" id="sp-cpu"></div></div>
     <div class="c"><div class="c-label">GPU Temp</div><div class="val" id="v-gt">\u2014<span class="unit">\u00b0C</span></div><div class="sub" id="v-gp"></div><div class="spark" id="sp-gpu"></div></div>
-    <div class="c"><div class="c-label">GPU Load</div><div class="val" id="v-gb">\u2014<span class="unit">%</span></div><div class="sub" id="v-vr"></div><div class="bar-track"><div class="bar-fill" id="b-gpu" style="width:0;background:var(--accent)"></div></div></div>
-    <div class="c"><div class="c-label">Memory</div><div class="val" id="v-mu">\u2014<span class="unit">GB</span></div><div class="sub" id="v-md"></div><div class="bar-track"><div class="bar-fill" id="b-mem" style="width:0;background:var(--cyan)"></div></div></div>
+    <div class="c"><div class="c-label">GPU Load</div><div class="val" id="v-gb">\u2014<span class="unit">%</span></div><div class="sub" id="v-vr"></div><div class="bar-track"><div class="bar-fill" id="b-gpu" class="bar-accent"></div></div></div>
+    <div class="c"><div class="c-label">Memory</div><div class="val" id="v-mu">\u2014<span class="unit">GB</span></div><div class="sub" id="v-md"></div><div class="bar-track"><div class="bar-fill" id="b-mem" class="bar-cyan"></div></div></div>
   </div></div>
   <div class="sec"><div class="g g3">
-    <div class="c"><div class="c-label">Power</div><div class="sub" id="v-pw" style="font-size:12px;margin-top:2px">\u2014</div></div>
-    <div class="c"><div class="c-label">Swap</div><div class="val val-sm" id="v-sw">\u2014</div><div class="bar-track"><div class="bar-fill" id="b-swap" style="width:0;background:var(--orange)"></div></div></div>
-    <div class="c"><div class="c-label">Disk /</div><div class="val val-sm" id="v-dk">\u2014<span class="unit">%</span></div><div class="bar-track"><div class="bar-fill" id="b-disk" style="width:0;background:var(--ok)"></div></div></div>
+    <div class="c"><div class="c-label">Power</div><div class="sub sub-pw" id="v-pw">\u2014</div></div>
+    <div class="c"><div class="c-label">Swap</div><div class="val val-sm" id="v-sw">\u2014</div><div class="bar-track"><div class="bar-fill" id="b-swap" class="bar-orange"></div></div></div>
+    <div class="c"><div class="c-label">Disk /</div><div class="val val-sm" id="v-dk">\u2014<span class="unit">%</span></div><div class="bar-track"><div class="bar-fill" id="b-disk" class="bar-ok"></div></div></div>
   </div></div>
   <div class="sec"><div class="g g2">
     <div class="c"><div class="c-label">Network</div><div id="v-net"></div></div>
@@ -138,7 +203,7 @@ function buildPanels() {
   <div class="sec"><div class="g g3">
     <div class="c"><div class="c-label">ntsync</div><div id="v-nts"></div></div>
     <div class="c"><div class="c-label">ZRAM</div><div class="sub" id="v-zram">\u2014</div></div>
-    <div class="c"><div class="c-label">Load Average</div><div class="sub" id="v-load" style="font-size:15px;font-family:var(--mono)">\u2014</div></div>
+    <div class="c"><div class="c-label">Load Average</div><div class="sub sub-load" id="v-load">\u2014</div></div>
   </div></div>
 </div>
 <div class="tab hidden" id="p-check">
@@ -171,14 +236,14 @@ function buildPanels() {
   <div class="sec">
     <div class="sec-label">System Cleanup</div>
     <div class="c">
-      <p style="color:var(--text-dim);margin-bottom:10px;font-size:12px">Clean package cache, journal, orphans.</p>
+      <p class="act-desc">Clean package cache, journal, orphans.</p>
       <div class="btns"><button class="btn btn-run" id="btn-clean-dry">Dry Run</button><button class="btn btn-d btn-run" id="btn-clean">Clean System</button></div>
     </div>
   </div>
   <div class="sec">
     <div class="sec-label">Install / Re-deploy</div>
     <div class="c">
-      <p style="color:var(--text-dim);margin-bottom:10px;font-size:12px">Full ry-install deployment \u2014 configs, packages, services.</p>
+      <p class="act-desc">Full ry-install deployment \u2014 configs, packages, services.</p>
       <div class="btns"><button class="btn btn-run" id="btn-inst-dry">Dry Run</button><button class="btn btn-d btn-run" id="btn-inst">Install All</button></div>
     </div>
   </div>
@@ -189,7 +254,7 @@ function buildPanels() {
   <div class="sec">
     <div class="sec-label">Test Suite</div>
     <div class="c">
-      <p style="color:var(--text-dim);margin-bottom:10px;font-size:12px">Run all safe modes and generate NDJSON logs.</p>
+      <p class="act-desc">Run all safe modes and generate NDJSON logs.</p>
       <button class="btn btn-run" id="btn-test">Run Test All</button>
     </div>
   </div>
@@ -349,16 +414,26 @@ function showConfirm(title, desc, onOk) {
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────
+let sseBackoff = 0;
+const SSE_BACKOFF_STEPS = [5000, 10000, 20000, 40000, 60000];
 function connectSSE() {
   if (evtSrc) evtSrc.close();
   evtSrc = new EventSource('/api/telemetry/stream');
-  evtSrc.onopen = () => { $('#conn').innerHTML = '<span class="dot dot-ok"></span>live'; };
-  evtSrc.onmessage = e => { try { update(JSON.parse(e.data)); } catch {} };
+  evtSrc.onopen = () => {
+    sseBackoff = 0;
+    $('#conn').innerHTML = '<span class="dot dot-ok"></span>live';
+  };
+  evtSrc.onmessage = e => {
+    try { update(JSON.parse(e.data)); }
+    catch (err) { console.warn('SSE parse failed:', err); }
+  };
   evtSrc.onerror = () => {
     if (evtSrc) evtSrc.close();
     evtSrc = null;
-    $('#conn').innerHTML = '<span class="dot dot-err"></span>reconnecting';
-    setTimeout(connectSSE, 5000);
+    const delay = SSE_BACKOFF_STEPS[Math.min(sseBackoff, SSE_BACKOFF_STEPS.length - 1)];
+    sseBackoff++;
+    $('#conn').innerHTML = '<span class="dot dot-err"></span>reconnect in ' + (delay / 1000) + 's';
+    setTimeout(connectSSE, delay);
   };
 }
 
