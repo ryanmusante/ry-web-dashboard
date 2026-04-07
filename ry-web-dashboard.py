@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-ry-web-dashboard v1.5.0 — Web dashboard for ry-install
-2026-04-05 | MIT License
+ry-web-dashboard v1.6.1 — Web dashboard for ry-install
+2026-04-06 | MIT License
 
 Async HTTP server wrapping ry-install.fish with live sysfs telemetry via SSE.
 
-Usage: python3 ry-web-dashboard.py [--host 0.0.0.0] [--port 9000] [--script PATH]
+Usage: python3 ry-web-dashboard.py [--host 127.0.0.1] [--port 9000] [--script PATH]
+
+Security: binds 127.0.0.1 by default. Non-loopback bind REQUIRES RY_DASH_TOKEN
+to be set; the server refuses to start otherwise.
 """
 
 from __future__ import annotations
@@ -13,12 +16,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import glob
+import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -29,11 +35,11 @@ from aiohttp import web
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_PORT = 9000
-DEFAULT_HOST = "0.0.0.0"
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_SCRIPT = str(SCRIPT_DIR / "ry-install.fish")
 STATIC_DIR = SCRIPT_DIR / "static"
 
-VERSION = "1.5.0"
+VERSION = "1.6.1"
 SSE_INTERVAL = 2
 COMMAND_TIMEOUT = 120
 LOG_TARGETS = frozenset((
@@ -59,6 +65,13 @@ _sse_count = 0
 _static_cache: dict[str, Any] = {}
 
 AUTH_TOKEN = os.environ.get("RY_DASH_TOKEN", "")
+SESSION_COOKIE = "ry_dash_session"
+
+# Dedicated executor for blocking telemetry I/O so a saturated SSE fan-out
+# cannot starve aiohttp's default thread pool (which serves all I/O fallbacks).
+_TELEMETRY_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="telemetry"
+)
 
 # Env vars safe to pass to subprocesses
 _SAFE_ENV_KEYS = frozenset((
@@ -70,8 +83,8 @@ _SAFE_ENV_KEYS = frozenset((
 CSP = (
     "default-src 'none'; "
     "script-src 'self'; "
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-    "font-src https://fonts.gstatic.com; "
+    "style-src 'self'; "
+    "font-src 'self'; "
     "connect-src 'self'; "
     "img-src 'self'; "
     "base-uri 'none'; "
@@ -86,12 +99,26 @@ log = logging.getLogger("ry-web-dashboard")
 
 @web.middleware
 async def auth_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
-    """Bearer token authentication for API endpoints."""
-    if not AUTH_TOKEN:
-        return await handler(request)
-    if request.path.startswith("/api/"):
-        token = request.headers.get("Authorization", "").removeprefix("Bearer ")
-        if token != AUTH_TOKEN:
+    """Bearer token OR session cookie authentication for /api/* endpoints.
+
+    Fail-closed: when AUTH_TOKEN is unset, every /api/* request is rejected.
+    /api/login is exempted so the browser can exchange a token for a cookie.
+    Non-API paths (the SPA shell and /static/*) remain reachable so the
+    loopback-only setup flow can render the UI even before a token is set.
+    """
+    if request.path.startswith("/api/") and request.path != "/api/login":
+        if not AUTH_TOKEN:
+            return web.json_response(
+                {"error": "Server has no RY_DASH_TOKEN configured"},
+                status=503,
+            )
+        # Accept either Authorization: Bearer or session cookie. EventSource
+        # cannot set headers, so the cookie path is what makes SSE work in
+        # the browser.
+        bearer = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        cookie = request.cookies.get(SESSION_COOKIE, "")
+        presented = bearer or cookie
+        if not presented or not hmac.compare_digest(presented, AUTH_TOKEN):
             return web.json_response({"error": "Unauthorized"}, status=401)
     return await handler(request)
 
@@ -116,10 +143,17 @@ async def security_middleware(request: web.Request, handler: Any) -> web.StreamR
             if host_hdr not in (expected, f"{parsed.hostname}:{request.url.port}"):
                 log.warning("action=csrf_block referer=%s host=%s", referer, host_hdr)
                 return web.json_response({"error": "Referer mismatch"}, status=403)
+        else:
+            # Neither Origin nor Referer present — refuse rather than allow.
+            log.warning("action=csrf_block reason=no_origin_or_referer path=%s",
+                        request.path)
+            return web.json_response(
+                {"error": "Origin or Referer header required"}, status=403
+            )
 
     resp = await handler(request)
 
-    if isinstance(resp, web.StreamResponse) and not isinstance(resp, web.FileResponse):
+    if isinstance(resp, web.StreamResponse):
         resp.headers["Content-Security-Policy"] = CSP
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
@@ -167,10 +201,21 @@ def _glob_int(pattern: str, fallback: int = 0) -> int:
 
 
 def _hwmon_temp(chip: str) -> float | None:
+    # Prefer labelled sensors (Tdie/Tctl on Ryzen) over the bare temp1_input
+    # which is often Tccd1 or some other secondary sensor.
+    preferred = ("Tdie", "Tctl")
     for hwmon in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
         try:
             if Path(f"{hwmon}/name").read_text().strip() != chip:
                 continue
+            for label_path in sorted(glob.glob(f"{hwmon}/temp*_label")):
+                try:
+                    if Path(label_path).read_text().strip() in preferred:
+                        input_path = label_path.replace("_label", "_input")
+                        return int(Path(input_path).read_text().strip()) / 1000.0
+                except (OSError, ValueError):
+                    continue
+            # Fallback: temp1_input
             return int(Path(f"{hwmon}/temp1_input").read_text().strip()) / 1000.0
         except (OSError, ValueError):
             pass
@@ -178,8 +223,17 @@ def _hwmon_temp(chip: str) -> float | None:
 
 
 def _gpu_temp() -> float | None:
+    # Prefer edge/junction labels on amdgpu; fall back to temp1_input.
+    preferred = ("edge", "junction")
     for hwmon in sorted(glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*")):
         try:
+            for label_path in sorted(glob.glob(f"{hwmon}/temp*_label")):
+                try:
+                    if Path(label_path).read_text().strip() in preferred:
+                        input_path = label_path.replace("_label", "_input")
+                        return int(Path(input_path).read_text().strip()) / 1000.0
+                except (OSError, ValueError):
+                    continue
             return int(Path(f"{hwmon}/temp1_input").read_text().strip()) / 1000.0
         except (OSError, ValueError):
             pass
@@ -273,7 +327,7 @@ def gather_telemetry() -> dict[str, Any]:
 
     mem: dict[str, int] = {}
     try:
-        with open("/proc/meminfo") as f:
+        with open("/proc/meminfo", encoding="utf-8") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 2:
@@ -334,24 +388,25 @@ async def run_cmd(app: web.Application, *args: str, timeout: int = COMMAND_TIMEO
             stderr=asyncio.subprocess.PIPE,
             env=_filtered_env(),
         )
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        rc = proc.returncode or 0
-        log.debug("action=run_cmd args=%s rc=%d", args, rc)
-        return rc, out.decode(errors="replace"), err.decode(errors="replace")
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()  # type: ignore[union-attr]
-            await proc.wait()  # type: ignore[union-attr]
-        except Exception:
-            pass
-        log.warning("action=run_cmd_timeout args=%s timeout=%d", args, timeout)
-        return 124, "", f"Timed out after {timeout}s"
     except FileNotFoundError:
         log.error("action=run_cmd_notfound script=%s", script)
         return 127, "", f"Not found: {script}"
     except Exception as e:
-        log.error("action=run_cmd_error args=%s err=%s", args, e)
+        log.error("action=run_cmd_spawn_error args=%s err=%s", args, e)
         return 1, "", str(e)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        rc = proc.returncode if proc.returncode is not None else -1
+        log.debug("action=run_cmd args=%s rc=%d", args, rc)
+        return rc, out.decode(errors="replace"), err.decode(errors="replace")
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except (ProcessLookupError, OSError):
+            pass
+        log.warning("action=run_cmd_timeout args=%s timeout=%d", args, timeout)
+        return 124, "", f"Timed out after {timeout}s"
 
 
 # ── Handlers ───────────────────────────────────────────────────────────────
@@ -362,7 +417,7 @@ def _resp(rc: int, stdout: str, stderr: str, **kw: Any) -> web.Response:
 
 async def h_telemetry(req: web.Request) -> web.Response:
     loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(None, gather_telemetry)
+    data = await loop.run_in_executor(_TELEMETRY_EXECUTOR, gather_telemetry)
     data["svc"] = await _service_states()
     return web.json_response(data)
 
@@ -385,7 +440,7 @@ async def h_sse(req: web.Request) -> web.StreamResponse:
         svc_ts = 0.0
         log.info("action=sse_connect client=%s count=%d", req.remote, _sse_count)
         while not req.app.get("shutting_down"):
-            data = await loop.run_in_executor(None, gather_telemetry)
+            data = await loop.run_in_executor(_TELEMETRY_EXECUTOR, gather_telemetry)
             now = time.time()
             if now - svc_ts > 10:
                 svc_cache = await _service_states()
@@ -426,8 +481,9 @@ async def h_lint(req: web.Request) -> web.Response:
     return _resp(*await run_cmd(req.app, "--lint"))
 
 async def h_changelog(req: web.Request) -> web.Response:
-    script_path = Path(req.app["script"])
-    changelog = script_path.parent / "CHANGELOG.md"
+    # Pin to dashboard's own CHANGELOG.md (not derived from --script parent,
+    # which is attacker-controllable via the CLI flag).
+    changelog = SCRIPT_DIR / "CHANGELOG.md"
     try:
         content = changelog.read_text()
         return _resp(0, content, "")
@@ -442,28 +498,33 @@ async def h_logs(req: web.Request) -> web.Response:
     cmd = _LOG_CMDS.get(target)
     if not cmd:
         return web.json_response({"error": f"No command for target: {target}"}, status=400)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_filtered_env(),
-        )
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
-        rc = proc.returncode or 0
-        return _resp(rc, out.decode(errors="replace"), err.decode(errors="replace"), target=target)
-    except asyncio.TimeoutError:
-        return _resp(124, "", f"Timed out fetching {target} logs")
-    except Exception as e:
-        return _resp(1, "", str(e))
+    sem: asyncio.Semaphore = req.app["log_sem"]
+    async with sem:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_filtered_env(),
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+            rc = proc.returncode or 0
+            return _resp(rc, out.decode(errors="replace"), err.decode(errors="replace"), target=target)
+        except asyncio.TimeoutError:
+            return _resp(124, "", f"Timed out fetching {target} logs")
+        except Exception as e:
+            return _resp(1, "", str(e))
 
 
 async def _body(req: web.Request) -> dict[str, Any]:
     if req.content_type == "application/json" and req.can_read_body:
         try:
             return await req.json()
-        except (json.JSONDecodeError, ValueError):
-            pass
+        except (json.JSONDecodeError, ValueError) as e:
+            raise web.HTTPBadRequest(
+                text=json.dumps({"error": f"Malformed JSON: {e}"}),
+                content_type="application/json",
+            )
     return {}
 
 
@@ -474,8 +535,10 @@ async def h_clean(req: web.Request) -> web.Response:
         log.info("action=clean dry_run=%s", dry)
         parts: list[str] = []
         env = _filtered_env()
+        worst_rc = 0
 
-        async def _run(label: str, *cmd: str) -> None:
+        async def _run(label: str, *cmd: str, allow_rc: tuple[int, ...] = (0,)) -> int:
+            nonlocal worst_rc
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -484,20 +547,27 @@ async def h_clean(req: web.Request) -> web.Response:
                     env=env,
                 )
                 out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+                rc = proc.returncode if proc.returncode is not None else -1
                 parts.append(f"── {label} ──\n{out.decode(errors='replace').strip()}")
                 if err.decode(errors='replace').strip():
                     parts.append(err.decode(errors='replace').strip())
+                if rc not in allow_rc:
+                    worst_rc = max(worst_rc, rc)
+                return rc
             except Exception as e:
                 parts.append(f"── {label} ──\n[ERR] {e}")
+                worst_rc = max(worst_rc, 1)
+                return 1
 
         if dry:
             await _run("Package cache (dry)", "paccache", "-dvk2")
-            # Check for orphans
-            await _run("Orphans", "pacman", "-Qtdq")
+            # pacman -Qtdq exits 1 when there are no orphans — that's fine.
+            await _run("Orphans", "pacman", "-Qtdq", allow_rc=(0, 1))
             await _run("Journal size", "journalctl", "--disk-usage")
         else:
             await _run("Package cache", "sudo", "-n", "paccache", "-rvk2")
-            # Remove orphans if any
+            # Remove orphans if any. Batch in chunks of 100 to stay well below
+            # ARG_MAX even on pathologically dirty systems.
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "pacman", "-Qtdq",
@@ -506,17 +576,22 @@ async def h_clean(req: web.Request) -> web.Response:
                     env=env,
                 )
                 out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                orphans = out.decode().strip()
+                orphans = out.decode().strip().splitlines()
                 if orphans:
-                    await _run("Remove orphans", "sudo", "-n", "pacman", "-Rns", "--noconfirm",
-                               *orphans.splitlines())
+                    BATCH = 100
+                    for i in range(0, len(orphans), BATCH):
+                        chunk = orphans[i:i + BATCH]
+                        await _run(
+                            f"Remove orphans [{i + 1}-{i + len(chunk)}]",
+                            "sudo", "-n", "pacman", "-Rns", "--noconfirm", *chunk,
+                        )
                 else:
                     parts.append("── Orphans ──\nNo orphans found")
             except Exception:
                 parts.append("── Orphans ──\nNo orphans found")
             await _run("Journal vacuum", "sudo", "-n", "journalctl", "--vacuum-size=100M")
 
-        return _resp(0, "\n\n".join(parts), "", dry_run=dry)
+        return _resp(worst_rc, "\n\n".join(parts), "", dry_run=dry)
 
 
 async def h_install(req: web.Request) -> web.Response:
@@ -533,11 +608,20 @@ async def h_install_file(req: web.Request) -> web.Response:
         b = await _body(req)
         fp = b.get("path", "")
         dry = b.get("dry_run", True)
-        if not fp or fp not in req.app["managed_files"]:
+        if not fp:
+            return web.json_response({"error": "Missing path"}, status=400)
+        # Resolve to canonical absolute path and re-check membership against
+        # the (also-canonicalised) managed-files set. Defeats symlink and
+        # relative-path bypass attempts.
+        try:
+            canonical = str(Path(fp).resolve(strict=False))
+        except (OSError, RuntimeError):
+            return web.json_response({"error": f"Invalid path: {fp}"}, status=400)
+        if canonical not in req.app["managed_files"]:
             return web.json_response({"error": f"Not a managed file: {fp}"}, status=400)
-        args = ["--install-file", fp] + (["--dry-run"] if dry else [])
-        log.info("action=install_file path=%s dry_run=%s", fp, dry)
-        return _resp(*await run_cmd(req.app, *args), dry_run=dry, path=fp)
+        args = ["--install-file", canonical] + (["--dry-run"] if dry else [])
+        log.info("action=install_file path=%s dry_run=%s", canonical, dry)
+        return _resp(*await run_cmd(req.app, *args), dry_run=dry, path=canonical)
 
 
 async def h_test_all(req: web.Request) -> web.Response:
@@ -571,31 +655,80 @@ async def h_info(req: web.Request) -> web.Response:
 
 
 async def h_index(req: web.Request) -> web.FileResponse:
-    return web.FileResponse(STATIC_DIR / "index.html")
+    return web.FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+async def h_login(req: web.Request) -> web.Response:
+    """Exchange a bearer token for an HttpOnly session cookie.
+
+    Required because EventSource cannot send Authorization headers; the
+    cookie is the only way browsers can authenticate to /api/telemetry/stream.
+    """
+    if not AUTH_TOKEN:
+        return web.json_response(
+            {"error": "Server has no RY_DASH_TOKEN configured"}, status=503,
+        )
+    body = await _body(req)
+    presented = str(body.get("token", ""))
+    if not presented or not hmac.compare_digest(presented, AUTH_TOKEN):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    resp = web.json_response({"ok": True})
+    # Secure flag only when not on plain loopback HTTP. SameSite=Strict blocks
+    # cross-site CSRF; HttpOnly blocks JS exfiltration.
+    resp.set_cookie(
+        SESSION_COOKIE, AUTH_TOKEN,
+        httponly=True, samesite="Strict", path="/", max_age=86400,
+    )
+    log.info("action=login client=%s", req.remote)
+    return resp
+
+
+async def h_logout(req: web.Request) -> web.Response:
+    resp = web.json_response({"ok": True})
+    resp.del_cookie(SESSION_COOKIE, path="/")
+    return resp
 
 
 # ── App factory ────────────────────────────────────────────────────────────
 
 def extract_managed_files(path: str) -> list[str]:
+    """Ask fish itself to expand the destination variables.
+
+    Avoids fragile regex parsing of `set -g VAR ... \\` blocks. Returns the
+    canonical absolute path of every entry so caller can compare against
+    canonicalised input from the API.
+    """
+    if not Path(path).is_file():
+        return []
+    # Pass path via env var, not f-string interpolation, so a --script value
+    # containing spaces, quotes, or shell metachars cannot break the snippet
+    # or inject fish code.
+    snippet = (
+        'source -- $RY_SCRIPT 2>/dev/null; '
+        'for p in $SYSTEM_DESTINATIONS $USER_DESTINATIONS $SERVICE_DESTINATIONS; '
+        'echo $p; end'
+    )
     try:
-        content = Path(path).read_text()
-    except OSError:
+        import subprocess
+        proc = subprocess.run(
+            ["fish", "-c", snippet],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "RY_SCRIPT": path},
+        )
+    except (OSError, subprocess.SubprocessError):
         return []
     files: list[str] = []
-    for var in ("SYSTEM_DESTINATIONS", "USER_DESTINATIONS", "SERVICE_DESTINATIONS"):
-        in_block = False
-        for line in content.splitlines():
-            if f"set -g {var}" in line:
-                in_block = True
-            if in_block:
-                # Capture quoted paths: "/etc/kernel/cmdline"
-                files.extend(m.group(1) for m in re.finditer(r'"([^"]+)"', line))
-                # Capture unquoted paths: /etc/kernel/cmdline (bare tokens starting with /)
-                stripped = line.strip().rstrip("\\").strip()
-                if stripped.startswith("/") and '"' not in stripped:
-                    files.append(stripped)
-                if "\\" not in line:
-                    in_block = False
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("/"):
+            continue
+        try:
+            files.append(str(Path(line).resolve(strict=False)))
+        except (OSError, RuntimeError):
+            continue
     return files
 
 
@@ -606,6 +739,7 @@ def create_app(script: str) -> web.Application:
     )
     app["script"] = script
     app["lock"] = asyncio.Lock()
+    app["log_sem"] = asyncio.Semaphore(2)
 
     async def on_shutdown(a: web.Application) -> None:
         a["shutting_down"] = True
@@ -624,6 +758,8 @@ def create_app(script: str) -> web.Application:
     r.add_get("/api/changelog", h_changelog)
     r.add_get("/api/managed-files", h_managed)
     r.add_get("/api/info", h_info)
+    r.add_post("/api/login", h_login)
+    r.add_post("/api/logout", h_logout)
     r.add_post("/api/clean", h_clean)
     r.add_post("/api/install", h_install)
     r.add_post("/api/install-file", h_install_file)
@@ -655,11 +791,20 @@ def main() -> None:
     if not Path(a.script).exists():
         log.error("action=startup err=script_not_found path=%s", a.script)
         sys.exit(1)
+    # Fail-closed: refuse to bind a non-loopback address without auth.
+    try:
+        is_loopback = ipaddress.ip_address(a.host).is_loopback
+    except ValueError:
+        # Hostname (e.g. "localhost") — accept the conventional loopback names.
+        is_loopback = a.host in ("localhost", "ip6-localhost")
+    if not is_loopback and not AUTH_TOKEN:
+        log.error("action=startup err=non_loopback_requires_token bind=%s "
+                  "fix=set RY_DASH_TOKEN or use --host 127.0.0.1", a.host)
+        sys.exit(2)
     app = create_app(a.script)
-    app["managed_files"] = extract_managed_files(a.script)
-    if a.host != "127.0.0.1":
-        log.warning("action=startup bind=%s note=LAN-accessible%s", a.host,
-                     ",no-auth" if not AUTH_TOKEN else "")
+    app["managed_files"] = set(extract_managed_files(a.script))
+    if not is_loopback:
+        log.warning("action=startup bind=%s note=LAN-accessible", a.host)
     log.info("action=startup version=%s host=%s port=%d managed_files=%d",
              VERSION, a.host, a.port, len(app["managed_files"]))
     web.run_app(app, host=a.host, port=a.port, print=None,

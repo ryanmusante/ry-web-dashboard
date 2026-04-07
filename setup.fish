@@ -19,13 +19,26 @@ set -l svc_dir "$HOME/.config/systemd/user"
 echo "ry-web-dashboard setup"
 echo "────────────────────"
 
-# 1. Install aiohttp
+# 1. Install aiohttp (prefer distro package on Arch/CachyOS, fall back to pip)
 if not python3 -c "import aiohttp" 2>/dev/null
-    echo "Installing aiohttp..."
-    pip install aiohttp --break-system-packages --quiet 2>/dev/null
-    or begin
-        echo "Error: pip install failed" >&2
-        exit 1
+    if command -q pacman
+        echo "Installing python-aiohttp via pacman..."
+        sudo pacman -S --needed --noconfirm python-aiohttp
+        or begin
+            echo "Error: pacman install failed; falling back to pip" >&2
+            pip install aiohttp --user --break-system-packages --quiet
+            or begin
+                echo "Error: pip install failed" >&2
+                exit 1
+            end
+        end
+    else
+        echo "Installing aiohttp via pip..."
+        pip install aiohttp --user --break-system-packages --quiet
+        or begin
+            echo "Error: pip install failed" >&2
+            exit 1
+        end
     end
 end
 echo "  ✓ aiohttp installed"
@@ -61,7 +74,7 @@ cp "$dash_dir/ry-web-dashboard.service" "$svc_dir/ry-web-dashboard.service"
 # Write drop-in override with concrete paths
 set -l dropin_dir "$svc_dir/ry-web-dashboard.service.d"
 mkdir -p "$dropin_dir"
-printf '[Service]\nExecStart=\nExecStart=/usr/bin/python3 %s/ry-web-dashboard.py --host 0.0.0.0 --port 9000 --script %s\nWorkingDirectory=%s\n' \
+printf '[Service]\nExecStart=\nExecStart=/usr/bin/python3 %s/ry-web-dashboard.py --host 127.0.0.1 --port 9000 --script %s\nWorkingDirectory=%s\n' \
     "$dash_dir" "$script_path" "$dash_dir" > "$dropin_dir/paths.conf"
 
 systemctl --user daemon-reload
@@ -69,8 +82,13 @@ echo "  ✓ service installed: $svc_dir/ry-web-dashboard.service"
 echo "  ✓ override: $dropin_dir/paths.conf"
 
 # 5. Enable and start
-systemctl --user enable --now ry-web-dashboard.service 2>/dev/null
-set -l svc_status (systemctl --user is-active ry-web-dashboard.service 2>/dev/null)
+systemctl --user enable --now ry-web-dashboard.service
+or begin
+    echo "Error: systemctl enable failed" >&2
+    echo "Check: journalctl --user -u ry-web-dashboard.service" >&2
+    exit 1
+end
+set -l svc_status (systemctl --user is-active ry-web-dashboard.service)
 if test "$svc_status" = active
     echo "  ✓ service running"
 else

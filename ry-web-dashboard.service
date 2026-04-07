@@ -6,7 +6,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 %h/ry-web-dashboard/ry-web-dashboard.py --host 0.0.0.0 --port 9000 --script %h/ry-install/ry-install.fish
+# Loopback bind by default. To expose on LAN, override --host AND set
+# RY_DASH_TOKEN in the EnvironmentFile below; the server refuses to start
+# on a non-loopback address without a token. Restrict :9000 to your LAN
+# at the firewall (see README → Firewall).
+EnvironmentFile=-%h/.config/ry-web-dashboard.env
+ExecStart=/usr/bin/python3 %h/ry-web-dashboard/ry-web-dashboard.py --host 127.0.0.1 --port 9000 --script %h/ry-install/ry-install.fish
 WorkingDirectory=%h/ry-web-dashboard
 Restart=on-failure
 RestartSec=5
@@ -15,22 +20,36 @@ StandardError=journal
 
 # Sandboxing — safe subset for user unit that invokes sudo
 PrivateTmp=yes
+ProtectSystem=full
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes
 ProtectClock=yes
 ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
 RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=yes
 RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
 NoNewPrivileges=no
 
 # Note: ry-install uses sudo internally for privileged operations.
 # Configure NOPASSWD sudo for unattended use (see README).
 # Cannot use: ProtectSystem=strict (writes /etc), ProtectHome=yes (reads ~/ry-install/),
-#             NoNewPrivileges=yes (sudo required).
+#             NoNewPrivileges=yes (sudo required), PrivateDevices=yes (blocks /dev/ntsync).
+# ProtectSystem=full leaves /etc writable while making /usr, /boot, /efi read-only —
+# the strongest level compatible with this service's actual write footprint.
+# ExecStart above uses %h placeholders; setup.fish installs a drop-in
+# (~/.config/systemd/user/ry-web-dashboard.service.d/paths.conf) with concrete
+# paths so the unit stays portable without rewriting it in place.
 
 [Install]
 WantedBy=default.target
